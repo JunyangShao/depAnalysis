@@ -29,7 +29,9 @@
 #include "pub_tool_basics.h"
 #include "pub_tool_tooliface.h"
 #include "pub_tool_libcassert.h"
+#include "pub_tool_mallocfree.h"
 #include "pub_tool_libcprint.h"
+#include "pub_tool_libcproc.h"
 #include "pub_tool_debuginfo.h"
 #include "pub_tool_libcbase.h"
 #include "pub_tool_options.h"
@@ -199,7 +201,7 @@ VG_REGPARM(2) static void st_callback(Addr var_addr, Addr inst_addr){
    static Addr addr;
    static Addr pc;
    static HChar filename[FILENAME_LEN];
-   static UInt linenum[LINENUM_LEN];
+   static UInt linenum;
    static HChar record[MT_REC_MAXLEN];
    addr = var_addr;
    pc = inst_addr;
@@ -207,7 +209,7 @@ VG_REGPARM(2) static void st_callback(Addr var_addr, Addr inst_addr){
    if(VG_(get_filename_linenum)(ep, pc, &filename, NULL, &linenum)){
       HChar* varname = get_varname(addr);
       UInt record_size = VG_(snprintf)(record, MT_REC_MAXLEN - 1, 
-                     "%s %x %s:%lu", varname, addr, filename, linenum)
+                     "%s %lx %s:%u", varname, addr, filename, linenum);
       VG_(free)(varname);
       if(record_size >= MT_REC_MAXLEN - 1)
          record_size = MT_REC_MAXLEN - 1;
@@ -219,7 +221,7 @@ VG_REGPARM(2) static void st_callback(Addr var_addr, Addr inst_addr){
       for(UInt i = 0; i < lcPtr; i++){
          HChar* depVarStr = get_shadow_mem(loadCache[i]);
          if(!depVarStr) continue;
-         UInt record_size = VG_(snprintf)(record + offset, leftspace, 
+         record_size = VG_(snprintf)(record + offset, leftspace, 
                ", %s", depVarStr);
          if(record_size >= leftspace) break;
          offset += record_size;
@@ -236,7 +238,7 @@ VG_REGPARM(2) static void ld_callback(Addr var_addr, Addr inst_addr){
    static Addr addr;
    static Addr pc;
    static HChar filename[FILENAME_LEN];
-   static UInt linenum[LINENUM_LEN];
+   static UInt linenum;
    addr = var_addr;
    pc = inst_addr;
    if(VG_(get_filename_linenum)(ep, pc, &filename, NULL, &linenum)){
@@ -256,18 +258,34 @@ static void da_post_clo_init(void)
 
 static
 IRSB* da_instrument ( VgCallbackClosure* closure,
-                      IRSB* bb,
+                      IRSB* sbIn,
                       const VexGuestLayout* layout, 
                       const VexGuestExtents* vge,
                       const VexArchInfo* archinfo_host,
                       IRType gWordTy, IRType hWordTy )
 {
-   IRSB*      sbOut;
-
    static IRExpr ** argv;
    static IRDirty* dirty;
    static Long diff;
-   for (Int i; i < sbIn->stmts_used; i++) {
+   static HChar filename[FILENAME_LEN];
+
+   DiEpoch  ep = VG_(current_DiEpoch)();
+   IRSB* sbOut;
+   Int i = 0;
+
+   if (gWordTy != hWordTy) {
+      /* We don't currently support this case. */
+      VG_(tool_panic)("host/guest word size mismatch");
+   }
+
+   sbOut = deepCopyIRSBExceptStmts(sbIn);
+   i = 0;
+   while (i < sbIn->stmts_used && sbIn->stmts[i]->tag != Ist_IMark) {
+      addStmtToIRSB( sbOut, sbIn->stmts[i] );
+      i++;
+   }
+
+   for (; i < sbIn->stmts_used; i++) {
       IRStmt* st = sbIn->stmts[i];
       if (!st || st->tag == Ist_NoOp) continue;
       switch (st->tag) {
@@ -298,7 +316,7 @@ IRSB* da_instrument ( VgCallbackClosure* closure,
             addStmtToIRSB(sbOut, st);
             break;
          case Ist_IMark:
-            if (VG_(get_fnname_if_entry)(st->Ist.IMark.addr, filename, sizeof(filename))) {
+            if (VG_(get_fnname_if_entry)(ep, st->Ist.IMark.addr, &filename)) {
                if(VG_(strcmp)(filename, "main") == 0) {
                   trace = True;
                }
