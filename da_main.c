@@ -27,21 +27,29 @@
 */
 
 #include "pub_tool_basics.h"
-#include "pub_tool_tooliface.h"
-#include "pub_tool_libcassert.h"
-#include "pub_tool_mallocfree.h"
-#include "pub_tool_libcprint.h"
-#include "pub_tool_libcproc.h"
 #include "pub_tool_debuginfo.h"
 #include "pub_tool_libcbase.h"
+#include "pub_tool_libcassert.h"
+#include "pub_tool_libcfile.h"
+#include "pub_tool_libcprint.h"
+#include "pub_tool_libcproc.h"
+#include "pub_tool_mallocfree.h"
 #include "pub_tool_options.h"
+#include "pub_tool_oset.h"
+#include "pub_tool_tooliface.h"
+#include "pub_tool_xarray.h"
+#include "pub_tool_clientstate.h"
 #include "pub_tool_machine.h"     
-#include "pub_tool_addrinfo.h"
+#include "pub_tool_mallocfree.h"
+#include "pub_tool_hashtable.h"
+#include "pub_tool_xarray.h"
+
 
 #define FILENAME_LEN 100
 #define LINENUM_LEN 100
 
-#define CODE_RANGE 0xFFFFF
+#define CODE_RANGE 0x04000000
+#define VAR_RANGE 0xFF000000
 // Let's assume 1MB process space
 
 #define MT_MAXLEN 10
@@ -62,13 +70,44 @@ static Bool tableOverflowed = False;
 static Addr seen[SEEN_PRIME_SIZE];
 static Bool seen_clash = False;
 
-#define LD_CACHE_MAXLEN 65535
+#define LD_CACHE_MAXLEN 1000
 static Addr loadCache[LD_CACHE_MAXLEN];
 static UInt lcPtr = 0;
 static UInt lcRecentRead = -1;
 static Bool lcOverflowed = False;
 
-static Addr firstPC = 0;
+static const HChar* trace_fnname = NULL;
+static VgFile* trace_f;
+static Bool da_process_cmd_line_option(const HChar* arg)
+{
+   if VG_STR_CLO(arg, "--trace-file", trace_fnname) {
+      if(!trace_fnname) trace_fnname = "./tmp";
+      trace_f = VG_(fopen)(trace_fnname, VKI_O_CREAT|VKI_O_WRONLY|VKI_O_TRUNC, VKI_S_IRUSR|VKI_S_IWUSR|VKI_S_IRGRP|VKI_S_IROTH);
+   }
+   else{
+      trace_fnname = "./tmp";
+      trace_f = VG_(fopen)(trace_fnname, VKI_O_CREAT|VKI_O_WRONLY|VKI_O_TRUNC, VKI_S_IRUSR|VKI_S_IWUSR|VKI_S_IRGRP|VKI_S_IROTH);
+   }
+   VG_(umsg)("%s\n", trace_fnname);
+   tl_assert(trace_f);
+   tl_assert(trace_fnname);
+   tl_assert(trace_fnname[0]);
+   return True;
+}
+
+static void da_print_usage(void)
+{  
+   VG_(printf)(
+"    --trace-file=<full path to file>  output path of tracefile\n"
+   );
+}
+
+static void da_print_debug_usage(void)
+{  
+   VG_(printf)(
+"    (none)\n"
+   );
+}
 
 static void insert_loadCache(Addr addr){
    if(lcRecentRead != -1){
@@ -140,6 +179,8 @@ static void set_shadow_mem(Addr addr, HChar* str, UInt size){
 
 static HChar* get_varname(Addr addr)
 {
+   if(addr > VAR_RANGE) 
+      return NULL;
    DiEpoch    ep = VG_(current_DiEpoch)();
    // AddrInfo ai;
    // VG_(describe_addr) (ep, addr, &ai);
@@ -215,20 +256,13 @@ VG_REGPARM(2) static void st_callback(Addr var_addr, Addr inst_addr){
    static const HChar* filename;
    static UInt linenum;
    static HChar record[MT_REC_MAXLEN];
-   static Long diff;
    addr = var_addr;
-   diff = addr - firstPC;
-   if(diff < 0) diff = -diff;
-   if(diff > CODE_RANGE){
-      return;
-   }
    pc = inst_addr;
    ep = VG_(current_DiEpoch)();
    HChar* varname = get_varname(addr);
-   if(varname == NULL){
-      VG_(free)(varname);
-      return;
-   } 
+   // if(varname == NULL){
+   //    return;
+   // } 
    UInt record_size = 0;
    if(VG_(get_filename_linenum)(ep, pc, &filename, NULL, &linenum)){
       record_size = VG_(snprintf)(record, MT_REC_MAXLEN - 1, 
@@ -254,38 +288,41 @@ VG_REGPARM(2) static void st_callback(Addr var_addr, Addr inst_addr){
             seen_clash = True;
          continue;
       }
-      seen[loadCache[i] %SEEN_PRIME_SIZE] = loadCache[i];
+      hit = seen[loadCache[i] %SEEN_PRIME_SIZE] = loadCache[i];
       HChar* depVarStr = get_shadow_mem(loadCache[i]);
       VG_(memset)(record + offset, 0, leftspace);
       if(!depVarStr){
          varname = get_varname(hit);
-         if(varname == NULL){
-            VG_(free)(varname);
-            continue;
-         }
+         // if(varname == NULL){
+         //    continue;
+         // }
+#ifdef DA_DEBUG
+         VG_(snprintf)(record + offset, leftspace, 
+               " <--- %s 0x%lx (null)", varname, hit);
+#else
          VG_(snprintf)(record + offset, leftspace, 
                " %s 0x%lx (null)", varname, hit);
+#endif
          VG_(free)(varname);
       }
       else{
+#ifdef DA_DEBUG
+         VG_(snprintf)(record + offset, leftspace, 
+               " <--- %s", depVarStr);
+#else
          VG_(snprintf)(record + offset, leftspace, 
                " %s", depVarStr);
+#endif
       }
-
       VG_(umsg)("%s\n", record);
+      VG_(fprintf)(trace_f, "%s\n", record);
    }
    return;
 }
 
 VG_REGPARM(2) static void ld_callback(Addr var_addr){
    static Addr addr;
-   static Long diff;
    addr = var_addr;
-   diff = addr - firstPC;
-   if(diff < 0) diff = -diff;
-   if(diff > CODE_RANGE){
-      return;
-   }
    insert_loadCache(addr);
    return;
 }
@@ -309,7 +346,6 @@ IRSB* da_instrument ( VgCallbackClosure* closure,
 {
    static IRExpr ** argv;
    static IRDirty* dirty;
-   static Long diff;
    static const HChar* filename;
 
    DiEpoch  ep = VG_(current_DiEpoch)();
@@ -337,10 +373,7 @@ IRSB* da_instrument ( VgCallbackClosure* closure,
          case Ist_Store:
             if(trace){
                // VG_(umsg)("Store!\n");
-               diff = curaddr - firstPC;
-               if(diff < 0) 
-                  diff = -diff;
-               if(diff < CODE_RANGE){
+               if(curaddr < CODE_RANGE){
                   argv = mkIRExprVec_2(st->Ist.Store.addr, mkIRExpr_HWord(curaddr));
                   dirty = unsafeIRDirty_0_N(2, "st_callback", VG_(fnptr_to_fnentry)( &st_callback ), argv);
                   addStmtToIRSB(sbOut, IRStmt_Dirty(dirty));
@@ -352,10 +385,7 @@ IRSB* da_instrument ( VgCallbackClosure* closure,
             if(trace){
                IRExpr* data = st->Ist.WrTmp.data;
                if (data->tag == Iex_Load) {
-                  diff = curaddr - firstPC;
-                  if(diff < 0) 
-                     diff = -diff;
-                  if(diff < CODE_RANGE){
+                  if(curaddr < CODE_RANGE){
                      argv = mkIRExprVec_1(data->Iex.Load.addr);
                      dirty = unsafeIRDirty_0_N(1, "ld_callback", VG_(fnptr_to_fnentry)( &ld_callback ), argv);
                      addStmtToIRSB(sbOut, IRStmt_Dirty(dirty));
@@ -374,9 +404,6 @@ IRSB* da_instrument ( VgCallbackClosure* closure,
                else if(VG_(strcmp)(filename, "exit") == 0) {
                   trace = False;
                }
-            }
-            if(firstPC == 0){
-               firstPC = st->Ist.IMark.addr;
             }
             addStmtToIRSB(sbOut, st);
             break;
@@ -400,7 +427,9 @@ static void da_fini(Int exitcode)
       VG_(umsg)("Seen hash map clashed!\n");
    }
    VG_(umsg)("Finished\n");
+   VG_(fclose)(trace_f);
 }
+
 static void da_pre_clo_init(void)
 {
    VG_(details_name)            ("depAnalysis");
@@ -415,8 +444,11 @@ static void da_pre_clo_init(void)
    VG_(basic_tool_funcs)        (da_post_clo_init,
                                  da_instrument,
                                  da_fini);
-
    VG_(needs_var_info)();
+
+   VG_(needs_command_line_options)(da_process_cmd_line_option,
+                                 da_print_usage,
+                                 da_print_debug_usage);
 }
 
 VG_DETERMINE_INTERFACE_VERSION(da_pre_clo_init)
