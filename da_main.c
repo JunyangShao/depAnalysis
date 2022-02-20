@@ -41,8 +41,8 @@
 #define FILENAME_LEN 100
 #define LINENUM_LEN 100
 
-#define CODE_RANGE 0xFFFFFFF
-// Let's assume 256MB process space
+#define CODE_RANGE 0xFFFFF
+// Let's assume 1MB process space
 
 #define MT_MAXLEN 10
 #define MT_REC_MAXLEN 202
@@ -58,7 +58,11 @@ static Memtable_entry table[MT_PRIME_SIZE];
 static Bool trace = False;
 static Bool tableOverflowed = False;
 
-#define LD_CACHE_MAXLEN 100
+#define SEEN_PRIME_SIZE 65537
+static Addr seen[SEEN_PRIME_SIZE];
+static Bool seen_clash = False;
+
+#define LD_CACHE_MAXLEN 65535
 static Addr loadCache[LD_CACHE_MAXLEN];
 static UInt lcPtr = 0;
 static UInt lcRecentRead = -1;
@@ -66,13 +70,15 @@ static Bool lcOverflowed = False;
 
 static Addr firstPC = 0;
 
-static void insert_loadCache(Addr addr, UInt linenum){
-   if(linenum != -1){
-      linenum = -1;
+static void insert_loadCache(Addr addr){
+   if(lcRecentRead != -1){
+      // VG_(umsg)("\tinsert - if...\n");
+      lcRecentRead = -1;
       loadCache[0] = addr;
       lcPtr = 1;
    }
    else{
+      // VG_(umsg)("\tinsert - else...\n");
       if(lcPtr < LD_CACHE_MAXLEN){
          loadCache[lcPtr++] = addr;
       }
@@ -84,41 +90,47 @@ static void insert_loadCache(Addr addr, UInt linenum){
 
 static void test_loadCache(UInt linenum){
    if(lcRecentRead == -1){
+      // VG_(umsg)("\ttest - if...\n");
       lcRecentRead = linenum;
    }
    else if(lcRecentRead != linenum){
+      // VG_(umsg)("\ttest - else...\n");
       lcPtr = 0;
    }
 }
 
 static HChar* get_shadow_mem(Addr addr){
    Int mt_index = addr % MT_PRIME_SIZE;
-   Memtable_entry lookup = table[mt_index];
-   for(Int i = 0; i < lookup.top; i++){
-      if(lookup.keys[i] == addr){
-         return lookup.values[i];
+   Memtable_entry *lookup = &table[mt_index];
+   for(Int i = 0; i < lookup->top; i++){
+      if(lookup->keys[i] == addr){
+         // VG_(umsg)("\tfound...\n");
+         return lookup->values[i];
       }
    }
+   // VG_(umsg)("\tnot found...\n");
    return NULL;
 }
 
 static void set_shadow_mem(Addr addr, HChar* str, UInt size){
    UInt mt_index = addr % MT_PRIME_SIZE;
-   Memtable_entry lookup = table[mt_index];
-   for(UInt i = 0; i < lookup.top; i++){
-      if(lookup.keys[i] == addr){
+   Memtable_entry *lookup = &table[mt_index];
+   for(UInt i = 0; i < lookup->top; i++){
+      if(lookup->keys[i] == addr){
+         // VG_(umsg)("\tupdates...\n");
          UInt copy_len = size < MT_REC_MAXLEN - 1 ? size : MT_REC_MAXLEN - 1;
-         VG_(memcpy)(lookup.values[i], str, copy_len);
-         lookup.values[i][copy_len + 1] = '\0';
+         VG_(memcpy)(lookup->values[i], str, copy_len);
+         lookup->values[i][copy_len + 1] = '\0';
          return;
       }
    }
-   if(lookup.top < MT_MAXLEN){
-      lookup.keys[lookup.top] = addr;
+   if(lookup->top < MT_MAXLEN){
+      // VG_(umsg)("\tnew insert...\n");
+      lookup->keys[lookup->top] = addr;
       UInt copy_len = size < MT_REC_MAXLEN - 1 ? size : MT_REC_MAXLEN - 1;
-      VG_(memcpy)(lookup.values[lookup.top], str, copy_len);
-      lookup.values[lookup.top][copy_len + 1] = '\0';
-      ++lookup.top;
+      VG_(memcpy)(lookup->values[lookup->top], str, copy_len);
+      lookup->values[lookup->top][copy_len + 1] = '\0';
+      ++lookup->top;
    }
    else{
       tableOverflowed = True;
@@ -200,50 +212,81 @@ VG_REGPARM(2) static void st_callback(Addr var_addr, Addr inst_addr){
    DiEpoch    ep;
    static Addr addr;
    static Addr pc;
-   static HChar filename[FILENAME_LEN];
+   static const HChar* filename;
    static UInt linenum;
    static HChar record[MT_REC_MAXLEN];
+   static Long diff;
    addr = var_addr;
+   diff = addr - firstPC;
+   if(diff < 0) diff = -diff;
+   if(diff > CODE_RANGE){
+      return;
+   }
    pc = inst_addr;
    ep = VG_(current_DiEpoch)();
-   if(VG_(get_filename_linenum)(ep, pc, &filename, NULL, &linenum)){
-      HChar* varname = get_varname(addr);
-      UInt record_size = VG_(snprintf)(record, MT_REC_MAXLEN - 1, 
-                     "%s %lx %s:%u", varname, addr, filename, linenum);
+   HChar* varname = get_varname(addr);
+   if(varname == NULL){
       VG_(free)(varname);
-      if(record_size >= MT_REC_MAXLEN - 1)
-         record_size = MT_REC_MAXLEN - 1;
-      set_shadow_mem(addr, record, record_size);
+      return;
+   } 
+   UInt record_size = 0;
+   if(VG_(get_filename_linenum)(ep, pc, &filename, NULL, &linenum)){
+      record_size = VG_(snprintf)(record, MT_REC_MAXLEN - 1, 
+                     "%s 0x%lx %s:%u", varname, addr, filename, linenum);
+   }
+   else{
+      record_size = VG_(snprintf)(record, MT_REC_MAXLEN - 1, 
+                     "%s 0x%lx (null)", varname, addr);
+   }
+   VG_(free)(varname);
+   if(record_size >= MT_REC_MAXLEN - 1)
+      record_size = MT_REC_MAXLEN - 1;
+   set_shadow_mem(addr, record, record_size);
 
-      test_loadCache(linenum);
-      UInt offset = record_size;
-      UInt leftspace = MT_REC_MAXLEN - 1 - record_size;
-      for(UInt i = 0; i < lcPtr; i++){
-         HChar* depVarStr = get_shadow_mem(loadCache[i]);
-         if(!depVarStr) continue;
-         record_size = VG_(snprintf)(record + offset, leftspace, 
-               ", %s", depVarStr);
-         if(record_size >= leftspace) break;
-         offset += record_size;
-         leftspace -= record_size;
+   test_loadCache(linenum);
+   UInt offset = record_size;
+   UInt leftspace = MT_REC_MAXLEN - 1 - record_size;
+   VG_(memset)(seen, 0, sizeof(Addr) * SEEN_PRIME_SIZE);
+   for(UInt i = 0; i < lcPtr; i++){
+      Addr hit = seen[loadCache[i] % SEEN_PRIME_SIZE];
+      if(hit != 0){
+         if(hit != loadCache[i])
+            seen_clash = True;
+         continue;
       }
+      seen[loadCache[i] %SEEN_PRIME_SIZE] = loadCache[i];
+      HChar* depVarStr = get_shadow_mem(loadCache[i]);
+      VG_(memset)(record + offset, 0, leftspace);
+      if(!depVarStr){
+         varname = get_varname(hit);
+         if(varname == NULL){
+            VG_(free)(varname);
+            continue;
+         }
+         VG_(snprintf)(record + offset, leftspace, 
+               " %s 0x%lx (null)", varname, hit);
+         VG_(free)(varname);
+      }
+      else{
+         VG_(snprintf)(record + offset, leftspace, 
+               " %s", depVarStr);
+      }
+
       VG_(umsg)("%s\n", record);
    }
-
    return;
 }
 
-VG_REGPARM(2) static void ld_callback(Addr var_addr, Addr inst_addr){
-   DiEpoch    ep = VG_(current_DiEpoch)();
+VG_REGPARM(2) static void ld_callback(Addr var_addr){
    static Addr addr;
-   static Addr pc;
-   static HChar filename[FILENAME_LEN];
-   static UInt linenum;
+   static Long diff;
    addr = var_addr;
-   pc = inst_addr;
-   if(VG_(get_filename_linenum)(ep, pc, &filename, NULL, &linenum)){
-      insert_loadCache(addr, linenum);
+   diff = addr - firstPC;
+   if(diff < 0) diff = -diff;
+   if(diff > CODE_RANGE){
+      return;
    }
+   insert_loadCache(addr);
    return;
 }
 
@@ -267,11 +310,12 @@ IRSB* da_instrument ( VgCallbackClosure* closure,
    static IRExpr ** argv;
    static IRDirty* dirty;
    static Long diff;
-   static HChar filename[FILENAME_LEN];
+   static const HChar* filename;
 
    DiEpoch  ep = VG_(current_DiEpoch)();
    IRSB* sbOut;
    Int i = 0;
+   Addr curaddr = 0;
 
    if (gWordTy != hWordTy) {
       /* We don't currently support this case. */
@@ -279,44 +323,51 @@ IRSB* da_instrument ( VgCallbackClosure* closure,
    }
 
    sbOut = deepCopyIRSBExceptStmts(sbIn);
-   i = 0;
+
    while (i < sbIn->stmts_used && sbIn->stmts[i]->tag != Ist_IMark) {
       addStmtToIRSB( sbOut, sbIn->stmts[i] );
       i++;
    }
-
+   
    for (; i < sbIn->stmts_used; i++) {
       IRStmt* st = sbIn->stmts[i];
       if (!st || st->tag == Ist_NoOp) continue;
+      // VG_(umsg)("%d,%d\n",i, st->tag);
       switch (st->tag) {
          case Ist_Store:
             if(trace){
-               diff = st->Ist.IMark.addr - firstPC;
+               // VG_(umsg)("Store!\n");
+               diff = curaddr - firstPC;
                if(diff < 0) 
                   diff = -diff;
                if(diff < CODE_RANGE){
-                  argv = mkIRExprVec_2(st->Ist.Store.addr, mkIRExpr_HWord(st->Ist.IMark.addr));
-                  dirty = unsafeIRDirty_0_N(2, "st_callback", VG_(fnptr_to_fnentry)(st_callback), argv);
+                  argv = mkIRExprVec_2(st->Ist.Store.addr, mkIRExpr_HWord(curaddr));
+                  dirty = unsafeIRDirty_0_N(2, "st_callback", VG_(fnptr_to_fnentry)( &st_callback ), argv);
                   addStmtToIRSB(sbOut, IRStmt_Dirty(dirty));
                }
             }
             addStmtToIRSB(sbOut, st);
             break;
-         case Ist_LoadG:
+         case Ist_WrTmp:
             if(trace){
-               diff = st->Ist.IMark.addr - firstPC;
-               if(diff < 0) 
-                  diff = -diff;
-               if(diff < CODE_RANGE){
-                  argv = mkIRExprVec_2(st->Ist.LoadG.details->addr, mkIRExpr_HWord(st->Ist.IMark.addr));
-                  dirty = unsafeIRDirty_0_N(2, "ld_callback", VG_(fnptr_to_fnentry)(ld_callback), argv);
-                  addStmtToIRSB(sbOut, IRStmt_Dirty(dirty));
+               IRExpr* data = st->Ist.WrTmp.data;
+               if (data->tag == Iex_Load) {
+                  diff = curaddr - firstPC;
+                  if(diff < 0) 
+                     diff = -diff;
+                  if(diff < CODE_RANGE){
+                     argv = mkIRExprVec_1(data->Iex.Load.addr);
+                     dirty = unsafeIRDirty_0_N(1, "ld_callback", VG_(fnptr_to_fnentry)( &ld_callback ), argv);
+                     addStmtToIRSB(sbOut, IRStmt_Dirty(dirty));
+                  }
                }
+
             }
             addStmtToIRSB(sbOut, st);
             break;
          case Ist_IMark:
-            if (VG_(get_fnname_if_entry)(ep, st->Ist.IMark.addr, &filename)) {
+            curaddr =  st->Ist.IMark.addr;
+            if (VG_(get_fnname_if_entry)(ep, curaddr, &filename)) {
                if(VG_(strcmp)(filename, "main") == 0) {
                   trace = True;
                }
@@ -331,6 +382,7 @@ IRSB* da_instrument ( VgCallbackClosure* closure,
             break;
          default:
             addStmtToIRSB(sbOut, st);
+            break;
       }
    }
    return sbOut;
@@ -344,6 +396,10 @@ static void da_fini(Int exitcode)
    if(lcOverflowed){
       VG_(umsg)("Load cache overflowed!\n");
    }
+   if(seen_clash){
+      VG_(umsg)("Seen hash map clashed!\n");
+   }
+   VG_(umsg)("Finished\n");
 }
 static void da_pre_clo_init(void)
 {
